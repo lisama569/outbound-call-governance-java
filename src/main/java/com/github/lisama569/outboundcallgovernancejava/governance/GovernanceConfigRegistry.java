@@ -1,6 +1,8 @@
 package com.github.lisama569.outboundcallgovernancejava.governance;
 
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -47,6 +49,10 @@ public class GovernanceConfigRegistry {
         }
         TargetState state = stateOf(target);
         synchronized (state) {
+            Optional<ConfigRejection> badFallback = validateFallback(target, config.fallback());
+            if (badFallback.isPresent()) {
+                return badFallback;
+            }
             // 回退冲突：新上限低于当前在途用量，拒绝并保持旧配置
             if (config.maxConcurrency() < state.limiter.currentInFlight()) {
                 return Optional.of(new ConfigRejection(
@@ -65,6 +71,45 @@ public class GovernanceConfigRegistry {
             state.config = config;
             return Optional.empty();
         }
+    }
+
+    /**
+     * 校验降级配置（原因 INVALID_FALLBACK，与普通非法配置可区分）：
+     * 静态值与降级目标互斥；降级目标必须已存在；不得自引用；不得沿既有降级链成环。
+     * 被拒绝时本目标与其他目标的配置均不受影响（校验先于任何状态修改）。
+     */
+    private Optional<ConfigRejection> validateFallback(String target, FallbackConfig fallback) {
+        if (fallback == null || fallback.isNone()) {
+            return Optional.empty();
+        }
+        if (fallback.staticValue() != null && fallback.fallbackTarget() != null) {
+            return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                    "staticValue and fallbackTarget are mutually exclusive"));
+        }
+        String next = fallback.fallbackTarget();
+        if (next == null) {
+            return Optional.empty(); // 纯静态兜底值，无链路约束
+        }
+        if (next.equals(target)) {
+            return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                    "fallback target must not be itself: " + next));
+        }
+        // 沿“新配置生效后”的降级链走查：next 必须存在，且链不得回到 target 或成环
+        Set<String> visited = new HashSet<>();
+        visited.add(target);
+        while (next != null) {
+            if (!visited.add(next)) {
+                return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                        "fallback chain forms a cycle at target: " + next));
+            }
+            TargetState nextState = states.get(next);
+            if (nextState == null) {
+                return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                        "fallback target does not exist: " + next));
+            }
+            next = nextState.config.fallback().fallbackTarget();
+        }
+        return Optional.empty();
     }
 
     private Optional<ConfigRejection> validate(TargetConfig c) {

@@ -4,7 +4,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -53,16 +55,80 @@ public class OutboundGateway {
         if (execution.status() != IdempotencyStatus.FRESH_EXECUTION) {
             log.info("requestId={} target={} key={} idempotent-join status={} originalRequestId={}",
                     requestId, target, key, execution.status(), outcome.requestId());
-            outcome = new CallOutcome(outcome.requestId(), outcome.target(), outcome.idempotencyKey(),
-                    outcome.status(), outcome.rejectionReason(), execution.status(),
-                    outcome.attempts(), outcome.circuitStateAfter(), outcome.value(), outcome.detail());
+            outcome = outcome.withIdempotencyStatus(execution.status());
         }
         return outcome;
     }
 
     private CallOutcome doCall(String requestId, String target, String key, String payload) {
+        // 整次请求（含主调用与降级链）的耗时预算起点：主目标自身的 retryBudgetMillis
+        long deadline = System.currentTimeMillis()
+                + configRegistry.configOf(target).retryBudgetMillis();
+        return executeWithFallback(requestId, target, key, payload, deadline, new HashSet<>());
+    }
+
+    /**
+     * 受治理执行 + 降级编排。主调用因下游持续失败、重试耗尽或熔断打开而失败时，
+     * 按目标配置转入降级路径（静态兜底值或降级目标）；降级目标同样走完整治理链路，
+     * 且整次请求不得超出 deadline——预算不足时不再发起任何新调用。
+     */
+    private CallOutcome executeWithFallback(String requestId, String target, String key,
+                                            String payload, long deadline, Set<String> chain) {
+        chain.add(target);
+        CallOutcome primary = executeGoverned(requestId, target, key, payload, deadline);
+        if (primary.status() == CallOutcome.Status.SUCCESS) {
+            return primary;
+        }
+        RejectionReason reason = primary.rejectionReason();
+        boolean fallbackable = reason == RejectionReason.CIRCUIT_OPEN
+                || reason == RejectionReason.DOWNSTREAM_FAILURE
+                || reason == RejectionReason.BUDGET_EXHAUSTED;
+        FallbackConfig fallback = configRegistry.configOf(target).fallback();
+        if (!fallbackable || fallback.isNone()) {
+            return primary;
+        }
+        if (fallback.staticValue() != null) {
+            log.info("requestId={} target={} key={} FALLBACK kind=STATIC_VALUE trigger={}",
+                    requestId, target, key, reason);
+            return CallOutcome.fallbackStatic(requestId, target, key,
+                    primary.idempotencyStatus(), primary.attempts(), primary.circuitStateAfter(),
+                    fallback.staticValue(), "static fallback after " + reason);
+        }
+        String fallbackTarget = fallback.fallbackTarget();
+        long remaining = deadline - System.currentTimeMillis();
+        if (remaining <= 0) {
+            // 预算不足以再发起一次调用：不再发起，最终结果为降级也失败
+            log.info("requestId={} target={} key={} FALLBACK kind=FALLBACK_TARGET fallbackTarget={} "
+                            + "NOT-ATTEMPTED reason=budget exhausted trigger={}",
+                    requestId, target, key, fallbackTarget, reason);
+            return CallOutcome.fallbackNotAttempted(primary,
+                    "fallback to " + fallbackTarget + " not attempted: request budget exhausted");
+        }
+        if (chain.contains(fallbackTarget)) {
+            // 运行期防护：配置层已拒绝成环，此处兜底避免无限回退
+            log.info("requestId={} target={} key={} FALLBACK kind=FALLBACK_TARGET fallbackTarget={} "
+                            + "NOT-ATTEMPTED reason=cycle in fallback chain",
+                    requestId, target, key, fallbackTarget);
+            return CallOutcome.fallbackNotAttempted(primary,
+                    "fallback to " + fallbackTarget + " not attempted: cycle in fallback chain");
+        }
+        log.info("requestId={} target={} key={} FALLBACK kind=FALLBACK_TARGET fallbackTarget={} "
+                        + "trigger={} budgetRemainingMs={}",
+                requestId, target, key, fallbackTarget, reason, remaining);
+        CallOutcome fallbackOutcome =
+                executeWithFallback(requestId, fallbackTarget, key, payload, deadline, chain);
+        return CallOutcome.fromFallbackTarget(primary, fallbackOutcome);
+    }
+
+    /**
+     * 单目标的受治理执行：配额 -> 并发 -> 熔断许可 -> 超时/重试。
+     * 耗时预算由调用方给定（主调用为自身预算，降级调用为整次请求的剩余预算），
+     * 单次超时与重试预算均被钳制在剩余预算之内。
+     */
+    private CallOutcome executeGoverned(String requestId, String target, String key,
+                                        String payload, long deadline) {
         GovernanceConfigRegistry.TargetState state = configRegistry.stateOf(target);
-        TargetConfig config = state.config;
+        TargetConfig config = clampToRemainingBudget(state.config, deadline);
         QuotaLimiter limiter = state.limiter;
         CircuitBreaker breaker = state.breaker;
 
@@ -99,17 +165,32 @@ public class OutboundGateway {
 
         try {
             // 4. 超时 + 重试（受耗时预算约束）
-            return executeWithRetry(requestId, target, key, payload, config, breaker, limiter);
+            return executeWithRetry(requestId, target, key, payload, config, breaker, deadline);
         } finally {
             limiter.releaseConcurrency();
         }
     }
 
+    /**
+     * 将单次超时与重试预算钳制在整次请求的剩余预算之内，
+     * 保证主调用与降级调用整体不超出请求级 deadline。
+     */
+    private TargetConfig clampToRemainingBudget(TargetConfig config, long deadline) {
+        long remaining = Math.max(1, deadline - System.currentTimeMillis());
+        long callTimeout = Math.min(config.callTimeoutMillis(), remaining);
+        long retryBudget = Math.min(config.retryBudgetMillis(), remaining);
+        if (callTimeout == config.callTimeoutMillis() && retryBudget == config.retryBudgetMillis()) {
+            return config;
+        }
+        return new TargetConfig(config.quotaPerWindow(), config.windowMillis(),
+                config.maxConcurrency(), callTimeout, config.maxAttempts(), config.backoffMillis(),
+                retryBudget, config.circuitFailureThreshold(), config.circuitResetMillis(),
+                config.fallback());
+    }
+
     private CallOutcome executeWithRetry(String requestId, String target, String key,
                                          String payload, TargetConfig config,
-                                         CircuitBreaker breaker, QuotaLimiter limiter) {
-        long start = System.currentTimeMillis();
-        long deadline = start + config.retryBudgetMillis();
+                                         CircuitBreaker breaker, long deadline) {
         int attempts = 0;
         String lastError = null;
         boolean budgetExhausted = false;
