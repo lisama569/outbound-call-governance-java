@@ -153,6 +153,17 @@ public class OutboundGateway {
             return primary.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
                     "fallback to " + fallbackTarget + " not attempted: request budget exhausted");
         }
+        long fallbackCallTimeout = configRegistry.configOf(fallbackTarget).callTimeoutMillis();
+        if (remaining < fallbackCallTimeout) {
+            // 剩余预算已不足以再完整跑一次降级调用：就地返回“降级也失败”，
+            // 绝不把降级调用发出去后再把预算花光、把整趟降级跑完。
+            log.info("requestId={} target={} key={} FALLBACK_SKIPPED target={} reason=budget insufficient"
+                            + " budgetRemainingMs={} fallbackCallTimeoutMs={}",
+                    requestId, target, key, fallbackTarget, remaining, fallbackCallTimeout);
+            return primary.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
+                    "fallback to " + fallbackTarget + " not attempted: request budget insufficient ("
+                            + remaining + "ms remaining < " + fallbackCallTimeout + "ms call timeout)");
+        }
         if (!chain.add(fallbackTarget)) {
             // 配置更新已拒绝成环，此处为运行期兜底防御
             log.info("requestId={} target={} key={} FALLBACK_SKIPPED target={} reason=cycle",
@@ -177,20 +188,19 @@ public class OutboundGateway {
                                          String payload, TargetConfig config,
                                          CircuitBreaker breaker, long requestDeadline) {
         long start = System.currentTimeMillis();
-        // 本目标的重试预算与整次请求的共享预算取更紧者
         long deadline = Math.min(requestDeadline, start + config.retryBudgetMillis());
         int attempts = 0;
         String lastError = null;
         boolean budgetExhausted = false;
 
         while (true) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                // 预算耗尽后不得继续发起调用（首次进入即耗尽时同样按预算收口）
+                budgetExhausted = true;
+                break;
+            }
             if (attempts > 0) {
-                // 预算耗尽后不得继续发起调用
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    budgetExhausted = true;
-                    break;
-                }
                 long backoff = Math.min(config.backoffMillis() * attempts, remaining);
                 try {
                     Thread.sleep(backoff);
@@ -198,13 +208,24 @@ public class OutboundGateway {
                     Thread.currentThread().interrupt();
                     break;
                 }
+                remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    budgetExhausted = true;
+                    break;
+                }
             }
             attempts++;
-            log.info("requestId={} target={} key={} attempt={}/{} budgetRemainingMs={} circuit={}",
+            // 任何一次调用都不得越过整份预算：单次等待取“自身单次超时”与“剩余预算”的更紧者。
+            // 当剩余预算容不下一次完整的单次超时时，本次等待被预算截断；
+            // 若仍以可重试失败（含超时）收场，说明预算已无法再支撑一次完整尝试，
+            // 直接按预算耗尽收口，不再重试。
+            long attemptTimeout = Math.min(config.callTimeoutMillis(), remaining);
+            boolean budgetClamped = config.callTimeoutMillis() > remaining;
+            log.info("requestId={} target={} key={} attempt={}/{} budgetRemainingMs={} waitTimeoutMs={} circuit={}",
                     requestId, target, key, attempts, config.maxAttempts(),
-                    deadline - System.currentTimeMillis(), breaker.state());
+                    remaining, attemptTimeout, breaker.state());
             try {
-                String value = invokeWithTimeout(target, payload, config.callTimeoutMillis());
+                String value = invokeWithTimeout(target, payload, attemptTimeout);
                 breaker.onSuccess();
                 log.info("requestId={} target={} key={} SUCCESS attempts={} circuit={}",
                         requestId, target, key, attempts, breaker.state());
@@ -212,9 +233,16 @@ public class OutboundGateway {
                         IdempotencyStatus.FRESH_EXECUTION, attempts, breaker.state(), value);
             } catch (DownstreamException e) {
                 lastError = e.getMessage();
-                log.info("requestId={} target={} key={} attempt={} failed retryable={} error={}",
-                        requestId, target, key, attempts, e.retryable(), e.getMessage());
-                if (!e.retryable() || attempts >= config.maxAttempts()) {
+                log.info("requestId={} target={} key={} attempt={} failed retryable={} budgetClamped={} error={}",
+                        requestId, target, key, attempts, e.retryable(), budgetClamped, e.getMessage());
+                if (!e.retryable()) {
+                    break;
+                }
+                if (budgetClamped) {
+                    budgetExhausted = true;
+                    break;
+                }
+                if (attempts >= config.maxAttempts()) {
                     break;
                 }
             }

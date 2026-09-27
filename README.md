@@ -35,12 +35,18 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
 
 ## 重试与幂等语义
 
-- **超时**：单次调用受 `callTimeoutMillis` 约束，超时按可重试失败处理。
+- **超时**：单次调用的等待上限为 `callTimeoutMillis`（预算更紧时还会被剩余预算进一步截断，
+  见下），超时按可重试失败处理。
 - **重试**：仅可重试失败（超时、`FAIL_RETRYABLE`）触发重试，最多 `maxAttempts` 次，
   退避为 `backoffMillis * attempt`。
-- **耗时预算**：整次请求（含全部重试与退避）受 `retryBudgetMillis` 约束；
-  每次发起新尝试前检查剩余预算，预算耗尽即停止，不再发起任何新调用，
-  结果记为 `BUDGET_EXHAUSTED`（与 `DOWNSTREAM_FAILURE` 可区分）。
+- **耗时预算**：整次请求（含全部重试与退避）受 `retryBudgetMillis` 约束。
+  - **任何一次调用都不得越过整份预算**：单次等待时长取“该目标 `callTimeoutMillis`”
+    与“当前剩余预算”的更紧者。因此当配置的整次预算小于单次超时时，主调用只会
+    等到剩余预算耗尽即按失败收口（`BUDGET_EXHAUSTED`），绝不会再按单次超时的
+    时长返回、把整次请求拖到预算的数倍；把一次被预算截断的等待再当正常返回也是
+    不允许的——截断后若仍以可重试失败（含超时）收场，即判定预算耗尽、不再重试。
+  - 每次发起新尝试前检查剩余预算，预算耗尽即停止，不再发起任何新调用，
+    结果记为 `BUDGET_EXHAUSTED`（与 `DOWNSTREAM_FAILURE` 可区分）。
 - **幂等**：以 `target + idempotencyKey` 为键，并发或重试的相同键请求只产生一次实质执行：
   - `FRESH_EXECUTION`：本次请求触发了实质执行；
   - `JOINED_IN_PROGRESS`：相同键正在执行中，本次挂接等待同一结果；
@@ -73,11 +79,18 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
 - **降级目标**（`FallbackConfig.target(t)`）：改调另一个已注册目标。
   降级**不是绕过治理的旁路**：降级目标走同一套治理管线，受其自身配额、并发、
   熔断与超时预算约束；降级目标自身也可再配置降级，形成链式回退。
-- **整次请求共享耗时预算**：请求入口以主目标的 `retryBudgetMillis` 划定总预算，
-  主调用与所有降级调用都在该预算之内；每个目标的重试预算取自身配置与剩余总预算的
-  更紧者。预算不足以再发起一次调用时不再发起，最终结果为降级也失败
-  （`fallbackKind=FALLBACK_TARGET` 的失败结果），不会无限向下回退；
-  运行期另有链去重防御，配置层则直接拒绝成环（见下）。
+- **整次请求共享耗时预算**：请求入口以主目标的 `retryBudgetMillis` 划定**一份**总预算，
+  主调用与所有降级调用都在这同一份预算之内，多级降级逐级递减；每个目标发起调用前，
+  其单次等待取“自身 `callTimeoutMillis`”与“剩余总预算”的更紧者（见“重试与幂等语义”）。
+  - **预算不足时不发起降级**：进入降级目标前，若剩余预算已小于该降级目标的
+    `callTimeoutMillis`（即已不足以再**完整**跑一次降级调用），则**不把降级调用发出去**，
+    就地返回“降级也失败”——保留主调用的失败状态（如 `BUDGET_EXHAUSTED` /
+    `DOWNSTREAM_FAILURE`），仅以 `fallbackKind=FALLBACK_TARGET` 标记这条路径，
+    detail 注明预算不足。因此不会出现把预算花光之后还把整趟降级调用跑完的情况。
+  - 静态兜底值不发起调用，不受剩余预算限制；运行期另有链去重防御，配置层则直接
+    拒绝成环（见下）。
+  - 无论最终是真实成功、降级成功还是降级也失败，整次请求的实际墙钟耗时都不应越过
+    配置的预算；并发发起多个请求时，每个请求各自持有独立的一份预算，互不挪用。
 - **结果可分辨**：`CallOutcome.fallbackKind` 标明结果来源——
   - `NONE`：真实成功（或真实失败，未走降级）；
   - `STATIC_VALUE`：降级返回的静态兜底值；
@@ -98,20 +111,27 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
 ## 本地验证
 
 ```bash
-# 运行全部测试（并发幂等、配额临界与配置变更、超时重试预算、熔断恢复）
+# 运行全部测试（并发幂等、配额临界与配置变更、超时重试预算、熔断恢复、耗时预算收口）
 mvn test
+
+# 只跑耗时预算收口用例（主调用/降级调用单次超时大于剩余预算、预算不足不降级、
+# 多级降级与并发边界）
+mvn -Dtest=BudgetEnforcementTest test
 
 # 启动服务后通过 REST 验证
 mvn spring-boot:run
-curl -X POST 'http://localhost:8080/gateway/call?target=pay&key=order-1&payload=x'
+# 把整次预算配得比单次超时还小（预算 300ms < 单次超时 1200ms）：
+# 主调用只会等到预算耗尽即失败返回，实际耗时约 300ms 而不是 1200ms。
 curl -X POST 'http://localhost:8080/gateway/config/pay' \
      -H 'Content-Type: application/json' \
      -d '{"quotaPerWindow":100,"windowMillis":60000,"maxConcurrency":10,
-          "callTimeoutMillis":2000,"maxAttempts":3,"backoffMillis":100,
-          "retryBudgetMillis":10000,"circuitFailureThreshold":3,"circuitResetMillis":5000,
-          "fallback":{"kind":"STATIC_VALUE","staticValue":"cached"}}'
-# 或以另一个已注册目标作为降级目标：
-#   "fallback":{"kind":"FALLBACK_TARGET","fallbackTarget":"pay-backup"}
+          "callTimeoutMillis":1200,"maxAttempts":1,"backoffMillis":0,
+          "retryBudgetMillis":300,"circuitFailureThreshold":3,"circuitResetMillis":5000,
+          "fallback":{"kind":"FALLBACK_TARGET","fallbackTarget":"pay-backup"}}'
+time curl -X POST 'http://localhost:8080/gateway/call?target=pay&key=order-1&payload=x'
+# 若 pay-backup 的 callTimeoutMillis 大于剩余预算（如 1000ms），降级不会发起，
+# 返回 status=FAILED、rejectionReason=BUDGET_EXHAUSTED、
+# fallbackKind=FALLBACK_TARGET（detail 注明预算不足），耗时仍在 300ms 量级。
 curl 'http://localhost:8080/gateway/state/pay'
 ```
 
@@ -125,5 +145,6 @@ curl 'http://localhost:8080/gateway/state/pay'
 | `QuotaAndConfigTest` | 配额临界、并发上限、运行中配置变更只影响对应目标、非法配置与回退冲突的可区分拒绝 |
 | `IdempotencyConcurrencyTest` | 8 线程并发同键调用仅一次实质执行、结果一致、执行中挂接与已完成回放可区分 |
 | `RetryBudgetTest` | 可重试失败重试到上限、不可重试失败不重试、超时重试受预算约束且预算耗尽后不再发起调用 |
+| `BudgetEnforcementTest` | 主调用单次超时大于整次预算时按预算截断收口、降级目标单次超时大于剩余预算时不发起降级、预算被主调用耗尽时就地返回“降级也失败”、多级降级共享预算逐级递减、并发请求各自不越过预算（含墙钟耗时断言） |
 | `CircuitBreakerTest` | 连续失败打开熔断、快速失败、半开单探测、探测成功闭合、探测失败重开且不放大调用量 |
 | `FallbackTest` | 主目标失败/熔断时走静态兜底与降级目标、链式降级、降级目标受自身配额/并发/熔断/超时约束、请求预算耗尽时不再发起降级、非法与成环降级配置以 `INVALID_FALLBACK` 拒绝且不影响既有配置 |
