@@ -146,12 +146,15 @@ public class OutboundGateway {
         }
         String fallbackTarget = fallback.fallbackTarget();
         long remaining = deadline - System.currentTimeMillis();
-        if (remaining <= 0) {
-            // 预算不足以再发起一次调用：不再发，最终结果为降级也失败
-            log.info("requestId={} target={} key={} FALLBACK_SKIPPED target={} reason=budget exhausted",
-                    requestId, target, key, fallbackTarget);
+        long fallbackCallTimeout = configRegistry.configOf(fallbackTarget).callTimeoutMillis();
+        if (remaining < fallbackCallTimeout) {
+            // 剩余预算不足以完整跑一次降级调用：不再发起，就地收口为降级也失败，
+            // 避免把预算花光之后还把整趟降级调用跑完、拖过整次请求的预算
+            log.info("requestId={} target={} key={} FALLBACK_SKIPPED target={} reason=insufficient budget remainingMs={} requiredMs={}",
+                    requestId, target, key, fallbackTarget, remaining, fallbackCallTimeout);
             return primary.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
-                    "fallback to " + fallbackTarget + " not attempted: request budget exhausted");
+                    "fallback to " + fallbackTarget + " not attempted: remaining budget "
+                            + remaining + "ms < fallback call timeout " + fallbackCallTimeout + "ms");
         }
         if (!chain.add(fallbackTarget)) {
             // 配置更新已拒绝成环，此处为运行期兜底防御
@@ -184,13 +187,13 @@ public class OutboundGateway {
         boolean budgetExhausted = false;
 
         while (true) {
+            // 任何一次尝试（含首次）发起前都必须确认预算未耗尽
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                budgetExhausted = true;
+                break;
+            }
             if (attempts > 0) {
-                // 预算耗尽后不得继续发起调用
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    budgetExhausted = true;
-                    break;
-                }
                 long backoff = Math.min(config.backoffMillis() * attempts, remaining);
                 try {
                     Thread.sleep(backoff);
@@ -198,13 +201,26 @@ public class OutboundGateway {
                     Thread.currentThread().interrupt();
                     break;
                 }
+                remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    budgetExhausted = true;
+                    break;
+                }
             }
             attempts++;
-            log.info("requestId={} target={} key={} attempt={}/{} budgetRemainingMs={} circuit={}",
+            // 单次调用超时不得越过剩余预算：整次请求的耗时预算优先于单次超时配置
+            long attemptTimeout = Math.min(config.callTimeoutMillis(), remaining);
+            log.info("requestId={} target={} key={} attempt={}/{} attemptTimeoutMs={} budgetRemainingMs={} circuit={}",
                     requestId, target, key, attempts, config.maxAttempts(),
-                    deadline - System.currentTimeMillis(), breaker.state());
+                    attemptTimeout, remaining, breaker.state());
             try {
-                String value = invokeWithTimeout(target, payload, config.callTimeoutMillis());
+                String value = invokeWithTimeout(target, payload, attemptTimeout);
+                if (System.currentTimeMillis() > deadline) {
+                    // 结果回来时预算已超：按失败收口，不把超长等待的结果当正常返回
+                    budgetExhausted = true;
+                    lastError = "call returned after request budget exhausted";
+                    break;
+                }
                 breaker.onSuccess();
                 log.info("requestId={} target={} key={} SUCCESS attempts={} circuit={}",
                         requestId, target, key, attempts, breaker.state());
@@ -214,6 +230,11 @@ public class OutboundGateway {
                 lastError = e.getMessage();
                 log.info("requestId={} target={} key={} attempt={} failed retryable={} error={}",
                         requestId, target, key, attempts, e.retryable(), e.getMessage());
+                if (deadline - System.currentTimeMillis() <= 0) {
+                    // 本次尝试已耗尽预算（如单次超时被剩余预算截断后超时）
+                    budgetExhausted = true;
+                    break;
+                }
                 if (!e.retryable() || attempts >= config.maxAttempts()) {
                     break;
                 }

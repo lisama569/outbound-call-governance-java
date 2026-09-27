@@ -39,8 +39,12 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
 - **重试**：仅可重试失败（超时、`FAIL_RETRYABLE`）触发重试，最多 `maxAttempts` 次，
   退避为 `backoffMillis * attempt`。
 - **耗时预算**：整次请求（含全部重试与退避）受 `retryBudgetMillis` 约束；
-  每次发起新尝试前检查剩余预算，预算耗尽即停止，不再发起任何新调用，
+  每次发起新尝试（含首次）前都检查剩余预算，预算耗尽即停止，不再发起任何新调用，
   结果记为 `BUDGET_EXHAUSTED`（与 `DOWNSTREAM_FAILURE` 可区分）。
+- **预算优先于单次超时**：每次尝试的实际超时取
+  `min(callTimeoutMillis, 剩余预算)`——当整次预算比单次调用超时更紧时以预算为准，
+  任何一次调用都不会把整次请求拖过预算；若结果返回时预算已超，
+  同样按失败（`BUDGET_EXHAUSTED`）收口，不把超长等待的结果当作正常返回。
 - **幂等**：以 `target + idempotencyKey` 为键，并发或重试的相同键请求只产生一次实质执行：
   - `FRESH_EXECUTION`：本次请求触发了实质执行；
   - `JOINED_IN_PROGRESS`：相同键正在执行中，本次挂接等待同一结果；
@@ -74,10 +78,14 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
   降级**不是绕过治理的旁路**：降级目标走同一套治理管线，受其自身配额、并发、
   熔断与超时预算约束；降级目标自身也可再配置降级，形成链式回退。
 - **整次请求共享耗时预算**：请求入口以主目标的 `retryBudgetMillis` 划定总预算，
-  主调用与所有降级调用都在该预算之内；每个目标的重试预算取自身配置与剩余总预算的
-  更紧者。预算不足以再发起一次调用时不再发起，最终结果为降级也失败
-  （`fallbackKind=FALLBACK_TARGET` 的失败结果），不会无限向下回退；
+  主调用与所有降级调用都在该预算之内，并随链路逐级递减；每个目标的重试预算取
+  自身配置与剩余总预算的更紧者，每次尝试的实际超时再被剩余预算截断。
+  剩余预算不足以完整跑一次降级调用（小于降级目标的 `callTimeoutMillis`）时，
+  不再发起降级调用，就地收口为降级也失败（`fallbackKind=FALLBACK_TARGET` 的失败结果），
+  不会把预算花光后还把整趟降级调用跑完，也不会无限向下回退；
   运行期另有链去重防御，配置层则直接拒绝成环（见下）。
+  无论最终是真实成功、降级成功还是降级也失败，整次请求的实际耗时都不越过该预算；
+  并发请求各自独立划定预算，互不影响。
 - **结果可分辨**：`CallOutcome.fallbackKind` 标明结果来源——
   - `NONE`：真实成功（或真实失败，未走降级）；
   - `STATIC_VALUE`：降级返回的静态兜底值；
@@ -98,8 +106,11 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
 ## 本地验证
 
 ```bash
-# 运行全部测试（并发幂等、配额临界与配置变更、超时重试预算、熔断恢复）
+# 运行全部测试（并发幂等、配额临界与配置变更、超时重试预算、熔断恢复、降级与请求预算）
 mvn test
+
+# 只跑耗时预算收口语义的边界用例（主/降级调用被预算截断、预算不足不降级、多级与并发）
+mvn test -Dtest=RequestBudgetTest
 
 # 启动服务后通过 REST 验证
 mvn spring-boot:run
@@ -127,3 +138,4 @@ curl 'http://localhost:8080/gateway/state/pay'
 | `RetryBudgetTest` | 可重试失败重试到上限、不可重试失败不重试、超时重试受预算约束且预算耗尽后不再发起调用 |
 | `CircuitBreakerTest` | 连续失败打开熔断、快速失败、半开单探测、探测成功闭合、探测失败重开且不放大调用量 |
 | `FallbackTest` | 主目标失败/熔断时走静态兜底与降级目标、链式降级、降级目标受自身配额/并发/熔断/超时约束、请求预算耗尽时不再发起降级、非法与成环降级配置以 `INVALID_FALLBACK` 拒绝且不影响既有配置 |
+| `RequestBudgetTest` | 主调用单次超时大于剩余预算时按预算截断、降级尝试的单次超时被共享预算截断、剩余预算不足以完整跑降级调用时不发起、多级降级共用预算逐级递减、并发请求各自不越过预算 |
