@@ -48,7 +48,6 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
   重复请求返回与首次执行一致的结果（同一 `requestId` 与返回值），且不再消耗下游调用。
 
 ## 熔断状态机
-
 ```
             连续失败 ≥ circuitFailureThreshold
  CLOSED  ────────────────────────────────►  OPEN
@@ -63,6 +62,39 @@ DownstreamClient ← SimulatedDownstream（可编程故障：HEALTHY / FAIL_RETR
   探测在途时其余请求同样快速失败，探测失败重新打开且不放大调用量。
 - 状态迁移只由已记录的调用结果驱动，避免临界点反复切换。
 
+## 降级模型
+
+每个目标可通过 `TargetConfig.fallback`（`FallbackConfig`）事先配置兜底方案，
+主调用走不通时自动转入降级路径：
+
+- **触发时机**：主目标重试耗尽（`DOWNSTREAM_FAILURE` / `BUDGET_EXHAUSTED`）、
+  被熔断挡下（`CIRCUIT_OPEN`）、或配额/并发拒绝时，进入降级路径。
+- **静态兜底值**（`FallbackConfig.staticValue(v)`）：直接返回配置值，不发起任何调用。
+- **降级目标**（`FallbackConfig.target(t)`）：改调另一个已注册目标。
+  降级**不是绕过治理的旁路**：降级目标走同一套治理管线，受其自身配额、并发、
+  熔断与超时预算约束；降级目标自身也可再配置降级，形成链式回退。
+- **整次请求共享耗时预算**：请求入口以主目标的 `retryBudgetMillis` 划定总预算，
+  主调用与所有降级调用都在该预算之内；每个目标的重试预算取自身配置与剩余总预算的
+  更紧者。预算不足以再发起一次调用时不再发起，最终结果为降级也失败
+  （`fallbackKind=FALLBACK_TARGET` 的失败结果），不会无限向下回退；
+  运行期另有链去重防御，配置层则直接拒绝成环（见下）。
+- **结果可分辨**：`CallOutcome.fallbackKind` 标明结果来源——
+  - `NONE`：真实成功（或真实失败，未走降级）；
+  - `STATIC_VALUE`：降级返回的静态兜底值；
+  - `FALLBACK_TARGET`：结果来自降级目标（成功或降级也失败）。
+  降级成功时 `status=SUCCESS` 但 `fallbackKind != NONE`，与真实成功一眼可辨。
+- **运行中更新与校验**：降级配置随 `updateConfig` 一起更新，只影响被更新的目标。
+  非法降级配置以 `INVALID_FALLBACK` 拒绝（与 `INVALID_CONFIG` / `ROLLBACK_CONFLICT`
+  可区分）：引用不存在的目标、把目标指成自身、或多个目标互指成环。
+  被拒绝时该目标原有配置与其他目标配置均不受影响。
+
+### 兼容范围
+
+- `TargetConfig` 保留原 9 参数构造器，未指定 `fallback` 时视为不降级（`NONE`），
+  既有代码与既有 JSON 配置（无 `fallback` 字段）行为完全不变。
+- 未配置降级的目标调用行为与之前一致；`CallOutcome` 新增 `fallbackKind` 字段，
+  既有路径恒为 `NONE`。
+
 ## 本地验证
 
 ```bash
@@ -76,7 +108,10 @@ curl -X POST 'http://localhost:8080/gateway/config/pay' \
      -H 'Content-Type: application/json' \
      -d '{"quotaPerWindow":100,"windowMillis":60000,"maxConcurrency":10,
           "callTimeoutMillis":2000,"maxAttempts":3,"backoffMillis":100,
-          "retryBudgetMillis":10000,"circuitFailureThreshold":3,"circuitResetMillis":5000}'
+          "retryBudgetMillis":10000,"circuitFailureThreshold":3,"circuitResetMillis":5000,
+          "fallback":{"kind":"STATIC_VALUE","staticValue":"cached"}}'
+# 或以另一个已注册目标作为降级目标：
+#   "fallback":{"kind":"FALLBACK_TARGET","fallbackTarget":"pay-backup"}
 curl 'http://localhost:8080/gateway/state/pay'
 ```
 
@@ -91,3 +126,4 @@ curl 'http://localhost:8080/gateway/state/pay'
 | `IdempotencyConcurrencyTest` | 8 线程并发同键调用仅一次实质执行、结果一致、执行中挂接与已完成回放可区分 |
 | `RetryBudgetTest` | 可重试失败重试到上限、不可重试失败不重试、超时重试受预算约束且预算耗尽后不再发起调用 |
 | `CircuitBreakerTest` | 连续失败打开熔断、快速失败、半开单探测、探测成功闭合、探测失败重开且不放大调用量 |
+| `FallbackTest` | 主目标失败/熔断时走静态兜底与降级目标、链式降级、降级目标受自身配额/并发/熔断/超时约束、请求预算耗尽时不再发起降级、非法与成环降级配置以 `INVALID_FALLBACK` 拒绝且不影响既有配置 |

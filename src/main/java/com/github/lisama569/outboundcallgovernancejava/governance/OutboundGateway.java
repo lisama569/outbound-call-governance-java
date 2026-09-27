@@ -4,7 +4,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -47,20 +49,27 @@ public class OutboundGateway {
         String key = (idempotencyKey == null || idempotencyKey.isBlank())
                 ? requestId : idempotencyKey;
         String scopedKey = target + "|" + key;
+        // 整次请求（含主调用与可能的降级调用）共享同一份耗时预算
+        long deadline = System.currentTimeMillis()
+                + configRegistry.configOf(target).retryBudgetMillis();
+        Set<String> chain = new HashSet<>();
+        chain.add(target);
         IdempotencyRegistry.Execution execution = idempotencyRegistry.execute(
-                scopedKey, () -> doCall(requestId, target, key, payload));
+                scopedKey, () -> doCall(requestId, target, key, payload, deadline, chain));
         CallOutcome outcome = execution.outcome();
         if (execution.status() != IdempotencyStatus.FRESH_EXECUTION) {
             log.info("requestId={} target={} key={} idempotent-join status={} originalRequestId={}",
                     requestId, target, key, execution.status(), outcome.requestId());
             outcome = new CallOutcome(outcome.requestId(), outcome.target(), outcome.idempotencyKey(),
                     outcome.status(), outcome.rejectionReason(), execution.status(),
-                    outcome.attempts(), outcome.circuitStateAfter(), outcome.value(), outcome.detail());
+                    outcome.attempts(), outcome.circuitStateAfter(), outcome.value(), outcome.detail(),
+                    outcome.fallbackKind());
         }
         return outcome;
     }
 
-    private CallOutcome doCall(String requestId, String target, String key, String payload) {
+    private CallOutcome doCall(String requestId, String target, String key, String payload,
+                               long deadline, Set<String> chain) {
         GovernanceConfigRegistry.TargetState state = configRegistry.stateOf(target);
         TargetConfig config = state.config;
         QuotaLimiter limiter = state.limiter;
@@ -71,9 +80,10 @@ public class OutboundGateway {
             log.info("requestId={} target={} key={} REJECTED reason={} basis=quota {}/{} circuit={}",
                     requestId, target, key, RejectionReason.QUOTA_EXHAUSTED,
                     limiter.currentWindowUsage(), limiter.quotaPerWindow(), breaker.state());
-            return CallOutcome.rejected(requestId, target, key, RejectionReason.QUOTA_EXHAUSTED,
-                    IdempotencyStatus.FRESH_EXECUTION, breaker.state(),
-                    "quota exhausted for target " + target);
+            return maybeFallback(requestId, target, key, payload, deadline, chain, config, breaker,
+                    CallOutcome.rejected(requestId, target, key, RejectionReason.QUOTA_EXHAUSTED,
+                            IdempotencyStatus.FRESH_EXECUTION, breaker.state(),
+                            "quota exhausted for target " + target));
         }
         // 2. 并发
         if (!limiter.tryAcquireConcurrency()) {
@@ -81,9 +91,10 @@ public class OutboundGateway {
             log.info("requestId={} target={} key={} REJECTED reason={} basis=in-flight {} circuit={}",
                     requestId, target, key, RejectionReason.CONCURRENCY_SATURATED,
                     limiter.currentInFlight(), breaker.state());
-            return CallOutcome.rejected(requestId, target, key, RejectionReason.CONCURRENCY_SATURATED,
-                    IdempotencyStatus.FRESH_EXECUTION, breaker.state(),
-                    "concurrency limit reached for target " + target);
+            return maybeFallback(requestId, target, key, payload, deadline, chain, config, breaker,
+                    CallOutcome.rejected(requestId, target, key, RejectionReason.CONCURRENCY_SATURATED,
+                            IdempotencyStatus.FRESH_EXECUTION, breaker.state(),
+                            "concurrency limit reached for target " + target));
         }
         // 3. 熔断许可
         if (!breaker.tryPermit()) {
@@ -92,24 +103,82 @@ public class OutboundGateway {
             log.info("requestId={} target={} key={} REJECTED reason={} basis=circuit={} consecutiveFailures={}",
                     requestId, target, key, RejectionReason.CIRCUIT_OPEN,
                     breaker.state(), breaker.consecutiveFailures());
-            return CallOutcome.rejected(requestId, target, key, RejectionReason.CIRCUIT_OPEN,
-                    IdempotencyStatus.FRESH_EXECUTION, breaker.state(),
-                    "circuit " + breaker.state() + " for target " + target);
+            return maybeFallback(requestId, target, key, payload, deadline, chain, config, breaker,
+                    CallOutcome.rejected(requestId, target, key, RejectionReason.CIRCUIT_OPEN,
+                            IdempotencyStatus.FRESH_EXECUTION, breaker.state(),
+                            "circuit " + breaker.state() + " for target " + target));
         }
 
         try {
             // 4. 超时 + 重试（受耗时预算约束）
-            return executeWithRetry(requestId, target, key, payload, config, breaker, limiter);
+            CallOutcome outcome = executeWithRetry(requestId, target, key, payload,
+                    config, breaker, deadline);
+            if (outcome.status() == CallOutcome.Status.SUCCESS) {
+                return outcome;
+            }
+            return maybeFallback(requestId, target, key, payload, deadline, chain,
+                    config, breaker, outcome);
         } finally {
             limiter.releaseConcurrency();
         }
     }
 
+    /**
+     * 主路径未成功时按配置进入降级路径。
+     * 降级不是旁路：降级目标走同一套 doCall，受其自身配额/并发/熔断/预算约束；
+     * 整次请求共享 deadline，预算不足时不再发起降级调用。
+     */
+    private CallOutcome maybeFallback(String requestId, String target, String key, String payload,
+                                      long deadline, Set<String> chain, TargetConfig config,
+                                      CircuitBreaker breaker, CallOutcome primary) {
+        FallbackConfig fallback = config.fallback();
+        if (fallback == null || fallback.kind() == FallbackConfig.Kind.NONE) {
+            return primary;
+        }
+        if (fallback.kind() == FallbackConfig.Kind.STATIC_VALUE) {
+            // 静态兜底不发起调用，不受剩余预算限制
+            log.info("requestId={} target={} key={} FALLBACK kind=STATIC_VALUE after={}",
+                    requestId, target, key, primary.rejectionReason());
+            return CallOutcome.fallback(requestId, target, key,
+                    IdempotencyStatus.FRESH_EXECUTION, primary.attempts(), breaker.state(),
+                    fallback.staticValue(), CallOutcome.FallbackKind.STATIC_VALUE,
+                    "static fallback after primary " + primary.rejectionReason());
+        }
+        String fallbackTarget = fallback.fallbackTarget();
+        long remaining = deadline - System.currentTimeMillis();
+        if (remaining <= 0) {
+            // 预算不足以再发起一次调用：不再发，最终结果为降级也失败
+            log.info("requestId={} target={} key={} FALLBACK_SKIPPED target={} reason=budget exhausted",
+                    requestId, target, key, fallbackTarget);
+            return primary.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
+                    "fallback to " + fallbackTarget + " not attempted: request budget exhausted");
+        }
+        if (!chain.add(fallbackTarget)) {
+            // 配置更新已拒绝成环，此处为运行期兜底防御
+            log.info("requestId={} target={} key={} FALLBACK_SKIPPED target={} reason=cycle",
+                    requestId, target, key, fallbackTarget);
+            return primary.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
+                    "fallback to " + fallbackTarget + " not attempted: cycle in fallback chain");
+        }
+        log.info("requestId={} target={} key={} FALLBACK kind=FALLBACK_TARGET target={} after={} budgetRemainingMs={}",
+                requestId, target, key, fallbackTarget, primary.rejectionReason(), remaining);
+        CallOutcome fb = doCall(requestId, fallbackTarget, key, payload, deadline, chain);
+        if (fb.status() == CallOutcome.Status.SUCCESS) {
+            return fb.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
+                    "fallback via target " + fallbackTarget
+                            + " after primary " + primary.rejectionReason());
+        }
+        // 降级目标也失败：不再继续回退（除非其自身配置了下一级降级，已在递归中处理）
+        return fb.withFallbackKind(CallOutcome.FallbackKind.FALLBACK_TARGET,
+                "fallback target " + fallbackTarget + " also failed: " + fb.detail());
+    }
+
     private CallOutcome executeWithRetry(String requestId, String target, String key,
                                          String payload, TargetConfig config,
-                                         CircuitBreaker breaker, QuotaLimiter limiter) {
+                                         CircuitBreaker breaker, long requestDeadline) {
         long start = System.currentTimeMillis();
-        long deadline = start + config.retryBudgetMillis();
+        // 本目标的重试预算与整次请求的共享预算取更紧者
+        long deadline = Math.min(requestDeadline, start + config.retryBudgetMillis());
         int attempts = 0;
         String lastError = null;
         boolean budgetExhausted = false;

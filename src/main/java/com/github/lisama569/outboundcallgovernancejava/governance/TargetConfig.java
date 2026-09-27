@@ -12,6 +12,7 @@ package com.github.lisama569.outboundcallgovernancejava.governance;
  * @param retryBudgetMillis       整次请求（含全部重试）的耗时预算（毫秒）
  * @param circuitFailureThreshold 连续失败达到该次数后熔断
  * @param circuitResetMillis      熔断打开后进入半开探测的等待时间（毫秒）
+ * @param fallback                降级配置（静态兜底值或降级目标；null 视为不降级）
  */
 public record TargetConfig(
         int quotaPerWindow,
@@ -22,7 +23,25 @@ public record TargetConfig(
         long backoffMillis,
         long retryBudgetMillis,
         int circuitFailureThreshold,
-        long circuitResetMillis) {
+        long circuitResetMillis,
+        FallbackConfig fallback) {
+
+    /** 兼容反序列化与旧配置：未指定降级时视为不降级。 */
+    public TargetConfig {
+        if (fallback == null) {
+            fallback = FallbackConfig.none();
+        }
+    }
+
+    /** 不含降级配置的兼容构造器（与既有 9 参数用法保持一致）。 */
+    public TargetConfig(int quotaPerWindow, long windowMillis, int maxConcurrency,
+                        long callTimeoutMillis, int maxAttempts, long backoffMillis,
+                        long retryBudgetMillis, int circuitFailureThreshold,
+                        long circuitResetMillis) {
+        this(quotaPerWindow, windowMillis, maxConcurrency, callTimeoutMillis,
+                maxAttempts, backoffMillis, retryBudgetMillis, circuitFailureThreshold,
+                circuitResetMillis, FallbackConfig.none());
+    }
 
     public static TargetConfig defaultConfig() {
         return new TargetConfig(100, 60_000, 10, 2_000, 3, 100, 10_000, 3, 5_000);

@@ -1,6 +1,8 @@
 package com.github.lisama569.outboundcallgovernancejava.governance;
 
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -45,6 +47,10 @@ public class GovernanceConfigRegistry {
         if (invalid.isPresent()) {
             return invalid;
         }
+        Optional<ConfigRejection> badFallback = validateFallback(target, config.fallback());
+        if (badFallback.isPresent()) {
+            return badFallback;
+        }
         TargetState state = stateOf(target);
         synchronized (state) {
             // 回退冲突：新上限低于当前在途用量，拒绝并保持旧配置
@@ -65,6 +71,49 @@ public class GovernanceConfigRegistry {
             state.config = config;
             return Optional.empty();
         }
+    }
+
+    /**
+     * 校验降级配置（拒绝原因 INVALID_FALLBACK，与普通非法配置可区分）：
+     * 引用不存在的目标、指向自身、或沿现有降级链会形成环。
+     * 校验失败时不触碰任何运行态，该目标原配置与其他目标配置均不受影响。
+     */
+    private Optional<ConfigRejection> validateFallback(String target, FallbackConfig fallback) {
+        if (fallback == null || fallback.kind() != FallbackConfig.Kind.FALLBACK_TARGET) {
+            return Optional.empty();
+        }
+        String fallbackTarget = fallback.fallbackTarget();
+        if (fallbackTarget == null || fallbackTarget.isBlank()) {
+            return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                    "fallback target must not be blank"));
+        }
+        if (fallbackTarget.equals(target)) {
+            return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                    "fallback target must not be the target itself: " + target));
+        }
+        if (!states.containsKey(fallbackTarget)) {
+            return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                    "fallback target does not exist: " + fallbackTarget));
+        }
+        // 环检测：假设本次更新生效，从降级目标沿现有链走，若回到 target 则成环
+        Set<String> visited = new HashSet<>();
+        visited.add(target);
+        String cursor = fallbackTarget;
+        while (cursor != null) {
+            if (!visited.add(cursor)) {
+                return Optional.of(new ConfigRejection(ConfigRejection.Reason.INVALID_FALLBACK,
+                        "fallback chain would form a cycle involving " + cursor));
+            }
+            TargetState cursorState = states.get(cursor);
+            if (cursorState == null) {
+                break;
+            }
+            FallbackConfig cursorFallback = cursorState.config.fallback();
+            cursor = (cursorFallback != null
+                    && cursorFallback.kind() == FallbackConfig.Kind.FALLBACK_TARGET)
+                    ? cursorFallback.fallbackTarget() : null;
+        }
+        return Optional.empty();
     }
 
     private Optional<ConfigRejection> validate(TargetConfig c) {
